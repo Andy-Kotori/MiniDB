@@ -16,6 +16,7 @@ index.py - 索引实现（角色C - 持久化与索引）
 import bisect
 from typing import Any, Dict, List, Optional, Union
 from enum import Enum
+from .bplustree import BPlusTreeIndex
 
 
 class IndexType(Enum):
@@ -165,9 +166,11 @@ class Index:
         self.index_type = index_type
         
         if index_type == IndexType.ORDERED_ARRAY:
-            self._index = OrderedIndex()
+            self._index: Union[OrderedIndex, BPlusTreeIndex] = OrderedIndex()
+        elif index_type == IndexType.BPLUS_TREE:
+            self._index = BPlusTreeIndex()
         else:
-            raise NotImplementedError("B+树索引还未实现")
+            raise ValueError(f"不支持的索引类型: {index_type}")
     
     def insert(self, value: Any, rid: int) -> None:
         """插入索引记录"""
@@ -220,7 +223,12 @@ class Index:
         index_type = IndexType(d.get('type', 'ordered_array'))
         
         index = cls(column, index_type)
-        index._index = OrderedIndex.from_dict(d['index'])
+        if index_type == IndexType.ORDERED_ARRAY:
+            index._index = OrderedIndex.from_dict(d['index'])
+        elif index_type == IndexType.BPLUS_TREE:
+            index._index = BPlusTreeIndex.from_dict(d['index'])
+        else:
+            raise ValueError(f"不支持的索引类型: {index_type}")
         return index
     
     def __repr__(self) -> str:
@@ -268,6 +276,22 @@ class IndexManager:
     def list_indices(self) -> List[str]:
         """列出所有有索引的列"""
         return list(self._indices.keys())
+
+    def get_index(self, column_name: str) -> Optional[Index]:
+        """获取指定列的索引对象"""
+        return self._indices.get(column_name)
+
+    def rename_index(self, old_name: str, new_name: str) -> bool:
+        """重命名索引关联的列名"""
+        if old_name not in self._indices:
+            return False
+        if new_name in self._indices:
+            raise ValueError(f"列 '{new_name}' 已存在索引")
+
+        index = self._indices.pop(old_name)
+        index.column_name = new_name
+        self._indices[new_name] = index
+        return True
     
     def on_insert(self, row_data: Dict[str, Any], rid: int) -> None:
         """

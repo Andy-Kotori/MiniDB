@@ -22,7 +22,7 @@ import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from storage import Database, Table, Row, SchemaMode, Persistence
+from storage import Database, Table, Row, SchemaMode, Persistence, IndexType
 
 
 class TestRunner:
@@ -51,6 +51,7 @@ class TestRunner:
         self.test_schema_mode()            # 优化点2
         self.test_column_operations()      # 优化点3
         self.test_encapsulation()          # 优化点4
+        self.test_indexing()
         self.test_database()
         self.test_persistence()
         self.test_integration()
@@ -258,6 +259,57 @@ class TestRunner:
         # 重新获取，rid 应该还是1
         row2 = table.get_by_rid(1)
         self.test("rid 不可修改", row2['rid'] == 1)
+
+    def test_indexing(self):
+        """测试索引功能，包括 B+树和删除维护"""
+        print("\n▶ 索引测试")
+
+        table = Table('orders', ['id', 'customer', 'amount'])
+        table.insert({'id': 1, 'customer': 'Alice', 'amount': 30})
+        table.insert({'id': 2, 'customer': 'Bob', 'amount': 10})
+        table.insert({'id': 3, 'customer': 'Charlie', 'amount': 20})
+        table.insert({'id': 4, 'customer': 'Diana', 'amount': 20})
+
+        self.test("create_index(B+树)", table.create_index('amount', IndexType.BPLUS_TREE))
+        self.test("重复创建索引返回 False", not table.create_index('amount', IndexType.BPLUS_TREE))
+
+        eq_rows = table.search_by_index('amount', 20, columns=['customer'])
+        self.test(
+            "B+树等值查询",
+            eq_rows == [
+                {'rid': 3, 'customer': 'Charlie'},
+                {'rid': 4, 'customer': 'Diana'},
+            ],
+        )
+
+        range_rows = table.search_range_by_index('amount', 20, 30, columns=['customer'])
+        self.test(
+            "B+树范围查询",
+            range_rows == [
+                {'rid': 3, 'customer': 'Charlie'},
+                {'rid': 4, 'customer': 'Diana'},
+                {'rid': 1, 'customer': 'Alice'},
+            ],
+        )
+
+        self.test("list_indices", table.list_indices() == ['amount'])
+        self.test("无索引列返回 None", table.search_by_index('customer', 'Alice') is None)
+
+        table.delete_by_rid(3)
+        self.test(
+            "delete_by_rid 维护索引",
+            table.search_by_index('amount', 20, columns=['customer']) == [{'rid': 4, 'customer': 'Diana'}],
+        )
+
+        table.delete_by_index(1)  # 删除 rid=2
+        self.test("delete_by_index 后行数正确", table.row_count == 2)
+        self.test(
+            "delete_by_index 维护索引",
+            table.search_by_index('amount', 10, columns=['customer']) == [],
+        )
+
+        table.rename_column('amount', 'total')
+        self.test("rename_column 保留索引", table.search_by_index('total', 30, columns=['customer']) == [{'rid': 1, 'customer': 'Alice'}])
     
     def test_database(self):
         """测试 Database 类"""
@@ -283,6 +335,10 @@ class TestRunner:
         # 按 rid 查询
         row = db.get_by_rid('users', 1, columns=['name'])
         self.test("db.get_by_rid 指定列", row == {'rid': 1, 'name': 'Alice'})
+
+        self.test("db.create_index", db.create_index('users', 'id', IndexType.BPLUS_TREE))
+        rows = db.search_by_index('users', 'id', 1, columns=['name'])
+        self.test("db.search_by_index", rows == [{'rid': 1, 'name': 'Alice'}])
         
         # 列操作快捷方式
         db.add_column('users', 'age', 18)
@@ -311,6 +367,8 @@ class TestRunner:
             db1.insert('loose_t', {'id': 1, 'extra': 'value'})  # 宽松模式扩列
             
             db1.add_column('strict_t', 'age', 20)
+            db1.create_index('strict_t', 'id', IndexType.BPLUS_TREE)
+            db1.create_index('strict_t', 'age')
             
             # 保存
             db_path = os.path.join(tmpdir, 'test.db')
@@ -332,6 +390,14 @@ class TestRunner:
             self.test("持久化：数据保留", len(strict_t.get_all()) == 1)
             self.test("持久化：扩列保留", 'extra' in loose_t.columns)
             self.test("持久化：add_column 保留", 'age' in strict_t.columns)
+            self.test(
+                "持久化：索引保留",
+                db2.search_by_index('strict_t', 'id', 1, columns=['name']) == [{'rid': 1, 'name': 'Alice'}],
+            )
+            self.test(
+                "持久化：范围索引保留",
+                db2.search_range_by_index('strict_t', 'age', 18, 30, columns=['name']) == [{'rid': 1, 'name': 'Alice'}],
+            )
             
             # 验证 rid 连续
             new_rid = db2.insert('strict_t', {'id': 2, 'name': 'Bob', 'age': 25})

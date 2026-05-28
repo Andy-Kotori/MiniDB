@@ -7,6 +7,7 @@ Storage 模块 - 内存存储引擎 + 索引支持
 from .database import Database, Table, Row, SchemaMode
 from .persistence import Persistence
 from .index import Index, IndexManager, IndexType, OrderedIndex
+from .bplustree import BPlusTreeIndex
 
 __all__ = [
     'Database', 
@@ -17,5 +18,6 @@ __all__ = [
     'Index',
     'IndexManager',
     'IndexType',
-    'OrderedIndex'
+    'OrderedIndex',
+    'BPlusTreeIndex'
 ]

@@ -207,6 +207,54 @@ class Table:
             columns: 指定列，None 表示所有列
         """
         return [row.to_dict(columns) for row in self._rows]
+
+    def create_index(self, column_name: str, index_type: IndexType = IndexType.ORDERED_ARRAY) -> bool:
+        """为指定列创建索引，并回填现有数据"""
+        if column_name not in self._columns:
+            raise ValueError(f"列 '{column_name}' 不存在")
+
+        created = self._index_manager.create_index(column_name, index_type)
+        if not created:
+            return False
+
+        index = self._index_manager.get_index(column_name)
+        for row in self._rows:
+            if index is not None:
+                index.insert(row.get(column_name), row.rid)
+        return True
+
+    def drop_index(self, column_name: str) -> bool:
+        """删除指定列上的索引"""
+        return self._index_manager.drop_index(column_name)
+
+    def list_indices(self) -> List[str]:
+        """列出已建索引的列"""
+        return self._index_manager.list_indices()
+
+    def search_by_index(
+        self,
+        column_name: str,
+        value: Any,
+        columns: Optional[List[str]] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """使用索引进行等值查询"""
+        rid_list = self._index_manager.search_eq(column_name, value)
+        if rid_list is None:
+            return None
+        return self._rows_from_rids(rid_list, columns)
+
+    def search_range_by_index(
+        self,
+        column_name: str,
+        min_value: Any = None,
+        max_value: Any = None,
+        columns: Optional[List[str]] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """使用索引进行范围查询"""
+        rid_list = self._index_manager.search_range(column_name, min_value, max_value)
+        if rid_list is None:
+            return None
+        return self._rows_from_rids(rid_list, columns)
     
     def delete_by_index(self, index: int) -> bool:
         """
@@ -217,14 +265,15 @@ class Table:
         """
         if index < 0 or index >= len(self._rows):
             return False
-        self._rows.pop(index)
+        row = self._rows.pop(index)
+        self._index_manager.on_delete(row._data, row.rid)
         return True
     
     def delete_by_rid(self, rid: int) -> bool:
         """根据 RowID 删除行"""
         for i, row in enumerate(self._rows):
-            self._index_manager.on_delete(row._data, row.rid)
             if row.rid == rid:
+                self._index_manager.on_delete(row._data, row.rid)
                 self._rows.pop(i)
                 return True
         return False
@@ -328,6 +377,7 @@ class Table:
         
         idx = self._columns.index(old_name)
         self._columns[idx] = new_name
+        self._index_manager.rename_index(old_name, new_name)
         
         for row in self._rows:
             if row.has_column(old_name):
@@ -335,6 +385,19 @@ class Table:
                 row.delete_column(old_name)
                 row.set(new_name, value)
         return True
+
+    def _rows_from_rids(
+        self,
+        rid_list: List[int],
+        columns: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """按 rid 顺序返回对应行"""
+        row_map = {row.rid: row for row in self._rows}
+        return [
+            row_map[rid].to_dict(columns)
+            for rid in rid_list
+            if rid in row_map
+        ]
     
     # ========== 序列化 ==========
     
@@ -345,6 +408,7 @@ class Table:
             'columns': self._columns,
             'next_rid': self._next_rid,
             'mode': self._mode.value,
+            'indices': self._index_manager.to_dict(),
             'rows': [
                 {'rid': row.rid, 'data': row._data}
                 for row in self._rows
@@ -360,6 +424,8 @@ class Table:
         for row_dict in d['rows']:
             row = Row(row_dict['rid'], row_dict['data'])
             table._rows.append(row)
+        if 'indices' in d:
+            table._index_manager = IndexManager.from_dict(d['indices'])
         return table
     
     def __repr__(self) -> str:
@@ -471,6 +537,50 @@ class Database:
         if table is None:
             return False
         return table.delete_by_index(index)
+
+    def create_index(
+        self,
+        table_name: str,
+        column_name: str,
+        index_type: IndexType = IndexType.ORDERED_ARRAY,
+    ) -> bool:
+        """为表的指定列创建索引"""
+        table = self._get_table_or_raise(table_name)
+        return table.create_index(column_name, index_type)
+
+    def drop_index(self, table_name: str, column_name: str) -> bool:
+        """删除表的指定索引"""
+        table = self._tables.get(table_name)
+        if table is None:
+            return False
+        return table.drop_index(column_name)
+
+    def search_by_index(
+        self,
+        table_name: str,
+        column_name: str,
+        value: Any,
+        columns: Optional[List[str]] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """使用索引进行等值查询"""
+        table = self._tables.get(table_name)
+        if table is None:
+            return None
+        return table.search_by_index(column_name, value, columns)
+
+    def search_range_by_index(
+        self,
+        table_name: str,
+        column_name: str,
+        min_value: Any = None,
+        max_value: Any = None,
+        columns: Optional[List[str]] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """使用索引进行范围查询"""
+        table = self._tables.get(table_name)
+        if table is None:
+            return None
+        return table.search_range_by_index(column_name, min_value, max_value, columns)
     
     # ========== 列操作快捷方式 ==========
     
