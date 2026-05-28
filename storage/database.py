@@ -8,6 +8,7 @@ database.py - 核心数据结构实现（优化版）
 4. 封装性：明确 private/public，通过接口访问
 """
 
+import pickle
 from typing import Any, Dict, List, Optional, Iterator, Set, Union
 from enum import Enum
 from .index import IndexManager, IndexType
@@ -82,12 +83,98 @@ class Row:
         return f"Row(rid={self._rid}, data={self._data})"
 
 
+class DataPage:
+    """内存中的数据页，用于承载多条记录"""
+
+    PAGE_SIZE = 4096
+    PAGE_OVERHEAD = 128
+    SLOT_OVERHEAD = 16
+
+    def __init__(self, page_id: int):
+        self.page_id = page_id
+        self._rows: List[Row] = []
+        self._rid_to_slot: Dict[int, int] = {}
+        self._used_bytes = self.PAGE_OVERHEAD
+
+    @classmethod
+    def _row_size(cls, row: Row) -> int:
+        """估算单行在页中的大小"""
+        payload = {'rid': row.rid, 'data': row._data}
+        return len(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)) + cls.SLOT_OVERHEAD
+
+    def row_count(self) -> int:
+        """页内行数"""
+        return len(self._rows)
+
+    def can_fit(self, row: Row) -> bool:
+        """检查页内是否能容纳新行"""
+        return self._used_bytes + self._row_size(row) <= self.PAGE_SIZE
+
+    def insert_row(self, row: Row) -> bool:
+        """插入行到当前页"""
+        if not self.can_fit(row):
+            return False
+
+        self._rows.append(row)
+        self._rid_to_slot[row.rid] = len(self._rows) - 1
+        self._used_bytes += self._row_size(row)
+        return True
+
+    def get_row(self, rid: int) -> Optional[Row]:
+        """按 rid 获取页内行"""
+        slot = self._rid_to_slot.get(rid)
+        if slot is None:
+            return None
+        return self._rows[slot]
+
+    def remove_row(self, rid: int) -> Optional[Row]:
+        """从页中删除一行"""
+        slot = self._rid_to_slot.pop(rid, None)
+        if slot is None:
+            return None
+
+        row = self._rows.pop(slot)
+        self._used_bytes -= self._row_size(row)
+
+        for i in range(slot, len(self._rows)):
+            self._rid_to_slot[self._rows[i].rid] = i
+
+        return row
+
+    def can_replace_row(self, rid: int, new_row: Row) -> bool:
+        """检查替换现有行后是否仍能放入当前页"""
+        current_row = self.get_row(rid)
+        if current_row is None:
+            return False
+
+        current_size = self._row_size(current_row)
+        new_size = self._row_size(new_row)
+        return self._used_bytes - current_size + new_size <= self.PAGE_SIZE
+
+    def replace_row(self, rid: int, new_row: Row) -> bool:
+        """替换页内现有行"""
+        slot = self._rid_to_slot.get(rid)
+        if slot is None or not self.can_replace_row(rid, new_row):
+            return False
+
+        old_row = self._rows[slot]
+        self._used_bytes -= self._row_size(old_row)
+        self._rows[slot] = new_row
+        self._used_bytes += self._row_size(new_row)
+        self._rid_to_slot[new_row.rid] = slot
+        return True
+
+    def iter_rows(self) -> Iterator[Row]:
+        """顺序遍历页内行"""
+        return iter(self._rows)
+
+
 class Table:
     """
     数据表实现（优化版）
     
     封装性：
-    - _name, _columns, _rows, _next_rid, _mode: 私有属性
+    - _name, _columns, _pages, _next_rid, _mode: 私有属性
     - 通过 property 提供只读访问
     - 修改必须通过接口方法
     
@@ -99,7 +186,10 @@ class Table:
     def __init__(self, name: str, columns: List[str], mode: SchemaMode = SchemaMode.STRICT):
         self._name = name
         self._columns = columns.copy()
-        self._rows: List[Row] = []
+        self._pages: List[DataPage] = []
+        self._rid_to_page: Dict[int, DataPage] = {}
+        self._row_order: List[int] = []
+        self._row_count = 0
         self._next_rid = 1
         self._mode = mode
         self._index_manager = IndexManager()
@@ -119,7 +209,12 @@ class Table:
     @property
     def row_count(self) -> int:
         """行数"""
-        return len(self._rows)
+        return self._row_count
+
+    @property
+    def page_count(self) -> int:
+        """页数"""
+        return len(self._pages)
     
     @property
     def next_rid(self) -> int:
@@ -160,9 +255,8 @@ class Table:
         full_data = {col: data.get(col) for col in self._columns}
         
         row = Row(self._next_rid, full_data)
-        self._rows.append(row)
-        
         assigned_rid = self._next_rid
+        self._store_row(row)
 
 
         # 维护索引
@@ -182,9 +276,10 @@ class Table:
         Returns:
             行字典，索引越界返回 None
         """
-        if index < 0 or index >= len(self._rows):
+        if index < 0 or index >= len(self._row_order):
             return None
-        return self._rows[index].to_dict(columns)
+        row = self._get_row(self._row_order[index])
+        return None if row is None else row.to_dict(columns)
     
     def get_by_rid(self, rid: int, columns: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
@@ -194,10 +289,8 @@ class Table:
             rid: 行号
             columns: 指定列，None 表示所有列
         """
-        for row in self._rows:
-            if row.rid == rid:
-                return row.to_dict(columns)
-        return None
+        row = self._get_row(rid)
+        return None if row is None else row.to_dict(columns)
     
     def get_all(self, columns: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
@@ -206,7 +299,7 @@ class Table:
         Args:
             columns: 指定列，None 表示所有列
         """
-        return [row.to_dict(columns) for row in self._rows]
+        return [row.to_dict(columns) for row in self._iter_rows()]
 
     def create_index(self, column_name: str, index_type: IndexType = IndexType.ORDERED_ARRAY) -> bool:
         """为指定列创建索引，并回填现有数据"""
@@ -218,7 +311,7 @@ class Table:
             return False
 
         index = self._index_manager.get_index(column_name)
-        for row in self._rows:
+        for row in self._iter_rows():
             if index is not None:
                 index.insert(row.get(column_name), row.rid)
         return True
@@ -263,20 +356,20 @@ class Table:
         Args:
             index: 行索引（从0开始）
         """
-        if index < 0 or index >= len(self._rows):
+        if index < 0 or index >= len(self._row_order):
             return False
-        row = self._rows.pop(index)
-        self._index_manager.on_delete(row._data, row.rid)
-        return True
+        rid = self._row_order[index]
+        return self.delete_by_rid(rid)
     
     def delete_by_rid(self, rid: int) -> bool:
         """根据 RowID 删除行"""
-        for i, row in enumerate(self._rows):
-            if row.rid == rid:
-                self._index_manager.on_delete(row._data, row.rid)
-                self._rows.pop(i)
-                return True
-        return False
+        row = self._get_row(rid)
+        if row is None:
+            return False
+
+        self._index_manager.on_delete(row._data, row.rid)
+        self._remove_row(rid)
+        return True
     
     def update_by_rid(self, rid: int, new_data: Dict[str, Any]) -> bool:
         """
@@ -285,12 +378,7 @@ class Table:
         - 只更新存在的列
         - 未知列：严格模式忽略，宽松模式扩列
         """
-        row = None
-        for r in self._rows:
-            if r.rid == rid:
-                row = r
-                break
-        
+        row = self._get_row(rid)
         if row is None:
             return False
         
@@ -311,8 +399,9 @@ class Table:
         # 维护索引
         old_data = row._data.copy()
         self._index_manager.on_update(old_data, valid_data, rid)
-
-        row.update(valid_data)
+        updated_row = Row(rid, old_data)
+        updated_row.update(valid_data)
+        self._replace_row(updated_row)
         return True
     
     # ========== 列操作（优化点3） ==========
@@ -332,16 +421,18 @@ class Table:
             return False
         
         self._columns.append(column)
-        for row in self._rows:
+        for row in self._iter_rows():
             row.set(column, default_value)
+        self._repack_pages()
         return True
     
     def _add_column_to_all_rows(self, column: str, default_value: Any) -> None:
         """内部方法：添加列到 schema 和所有行"""
         if column not in self._columns:
             self._columns.append(column)
-            for row in self._rows:
+            for row in self._iter_rows():
                 row.set(column, default_value)
+            self._repack_pages()
     
     def drop_column(self, column: str) -> bool:
         """
@@ -358,8 +449,9 @@ class Table:
         
         self._index_manager.drop_index(column)
         self._columns.remove(column)
-        for row in self._rows:
+        for row in self._iter_rows():
             row.delete_column(column)
+        self._repack_pages()
         return True
     
     def rename_column(self, old_name: str, new_name: str) -> bool:
@@ -379,12 +471,89 @@ class Table:
         self._columns[idx] = new_name
         self._index_manager.rename_index(old_name, new_name)
         
-        for row in self._rows:
+        for row in self._iter_rows():
             if row.has_column(old_name):
                 value = row.get(old_name)
                 row.delete_column(old_name)
                 row.set(new_name, value)
+        self._repack_pages()
         return True
+
+    def _iter_rows(self) -> Iterator[Row]:
+        """按逻辑顺序遍历表中所有行"""
+        for rid in self._row_order:
+            row = self._get_row(rid)
+            if row is not None:
+                yield row
+
+    def _get_row(self, rid: int) -> Optional[Row]:
+        """按 rid 获取运行时行对象"""
+        page = self._rid_to_page.get(rid)
+        if page is None:
+            return None
+        return page.get_row(rid)
+
+    def _store_row(self, row: Row, track_order: bool = True) -> None:
+        """把一行放入某个可容纳的数据页"""
+        for page in self._pages:
+            if page.insert_row(row):
+                self._rid_to_page[row.rid] = page
+                self._row_count += 1
+                if track_order:
+                    self._row_order.append(row.rid)
+                return
+
+        new_page = DataPage(len(self._pages))
+        if not new_page.insert_row(row):
+            raise ValueError("单行数据过大，无法放入数据页")
+
+        self._pages.append(new_page)
+        self._rid_to_page[row.rid] = new_page
+        self._row_count += 1
+        if track_order:
+            self._row_order.append(row.rid)
+
+    def _remove_row(self, rid: int) -> Optional[Row]:
+        """从页中移除一行，并维护行顺序"""
+        page = self._rid_to_page.pop(rid, None)
+        if page is None:
+            return None
+
+        row = page.remove_row(rid)
+        if row is not None:
+            self._row_count -= 1
+            self._row_order.remove(rid)
+        return row
+
+    def _replace_row(self, new_row: Row) -> None:
+        """替换一行，如当前页放不下则迁移到其他页"""
+        rid = new_row.rid
+        page = self._rid_to_page.get(rid)
+        if page is None:
+            raise ValueError(f"rid={rid} 不存在")
+
+        if page.replace_row(rid, new_row):
+            return
+
+        page.remove_row(rid)
+        del self._rid_to_page[rid]
+        self._row_count -= 1
+        self._store_row(new_row, track_order=False)
+
+    def _repack_pages(self) -> None:
+        """对全表重新分页，处理 schema 变更后的页大小变化"""
+        rows = [Row(row.rid, row._data) for row in self._iter_rows()]
+        row_order = self._row_order.copy()
+
+        self._pages = []
+        self._rid_to_page = {}
+        self._row_count = 0
+
+        row_map = {row.rid: row for row in rows}
+        for rid in row_order:
+            self._store_row(row_map[rid], track_order=False)
+
+        self._row_order = row_order
 
     def _rows_from_rids(
         self,
@@ -392,11 +561,10 @@ class Table:
         columns: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """按 rid 顺序返回对应行"""
-        row_map = {row.rid: row for row in self._rows}
         return [
-            row_map[rid].to_dict(columns)
+            self._get_row(rid).to_dict(columns)
             for rid in rid_list
-            if rid in row_map
+            if self._get_row(rid) is not None
         ]
     
     # ========== 序列化 ==========
@@ -411,7 +579,7 @@ class Table:
             'indices': self._index_manager.to_dict(),
             'rows': [
                 {'rid': row.rid, 'data': row._data}
-                for row in self._rows
+                for row in self._iter_rows()
             ]
         }
     
@@ -423,13 +591,13 @@ class Table:
         table._next_rid = d['next_rid']
         for row_dict in d['rows']:
             row = Row(row_dict['rid'], row_dict['data'])
-            table._rows.append(row)
+            table._store_row(row)
         if 'indices' in d:
             table._index_manager = IndexManager.from_dict(d['indices'])
         return table
     
     def __repr__(self) -> str:
-        return f"Table(name='{self._name}', columns={self._columns}, rows={len(self._rows)}, mode={self._mode.value})"
+        return f"Table(name='{self._name}', columns={self._columns}, rows={self._row_count}, pages={len(self._pages)}, mode={self._mode.value})"
 
 
 class Database:

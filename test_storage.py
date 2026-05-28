@@ -22,7 +22,16 @@ import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from storage import Database, Table, Row, SchemaMode, Persistence, IndexType
+from storage import (
+    Database,
+    Table,
+    Row,
+    SchemaMode,
+    Persistence,
+    IndexType,
+    PageManager,
+    PageType,
+)
 
 
 class TestRunner:
@@ -52,6 +61,8 @@ class TestRunner:
         self.test_column_operations()      # 优化点3
         self.test_encapsulation()          # 优化点4
         self.test_indexing()
+        self.test_table_paging()
+        self.test_page_manager()
         self.test_database()
         self.test_persistence()
         self.test_integration()
@@ -310,6 +321,60 @@ class TestRunner:
 
         table.rename_column('amount', 'total')
         self.test("rename_column 保留索引", table.search_by_index('total', 30, columns=['customer']) == [{'rid': 1, 'customer': 'Alice'}])
+
+    def test_page_manager(self):
+        """测试磁盘页管理器"""
+        print("\n▶ PageManager 测试")
+
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            page_path = os.path.join(tmpdir, 'pages.db')
+            manager = PageManager(page_path)
+
+            directory_payload = b'{"kind":"directory"}'
+            rows_payload = b'rows:' + b'a' * 5000
+            index_payload = b'index:' + b'b' * 100
+
+            dir_span = manager.append_payload(directory_payload, PageType.DIRECTORY)
+            row_span = manager.append_payload(rows_payload, PageType.ROWS)
+            index_span = manager.append_payload(index_payload, PageType.INDICES)
+            manager.write(directory_page_count=dir_span.page_count)
+
+            self.test("PageManager 目录页起始位置", dir_span.start_page_id == 0)
+            self.test("PageManager 行页跨页", row_span.page_count >= 2)
+            self.test("PageManager 总页数", manager.page_count == dir_span.page_count + row_span.page_count + index_span.page_count)
+
+            loaded = PageManager(page_path)
+            header = loaded.load()
+            self.test("PageManager 文件头页数", header.total_page_count == manager.page_count)
+            self.test("PageManager 读目录页", loaded.read_span(dir_span, PageType.DIRECTORY) == directory_payload)
+            self.test("PageManager 读行页", loaded.read_span(row_span, PageType.ROWS) == rows_payload)
+            self.test("PageManager 读索引页", loaded.read_span(index_span, PageType.INDICES) == index_payload)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_table_paging(self):
+        """测试 Table 运行时按页管理数据"""
+        print("\n▶ Table 分页测试")
+
+        table = Table('logs', ['id', 'payload'])
+        large_payload = 'x' * 3000
+
+        rid1 = table.insert({'id': 1, 'payload': large_payload})
+        rid2 = table.insert({'id': 2, 'payload': large_payload})
+        rid3 = table.insert({'id': 3, 'payload': large_payload})
+
+        self.test("Table 跨多页存储", table.page_count >= 3)
+        self.test("Table 分页后按 rid 查询", table.get_by_rid(rid2)['id'] == 2)
+        self.test("Table 分页后按索引查询", table.get_by_index(2)['rid'] == rid3)
+
+        table.update_by_rid(rid1, {'payload': 'y' * 3500})
+        self.test("Table 分页后更新仍可查询", table.get_by_rid(rid1)['payload'] == 'y' * 3500)
+
+        table.delete_by_rid(rid2)
+        self.test("Table 分页后删除维护行数", table.row_count == 2)
+        self.test("Table 分页后逻辑顺序正确", table.get_by_index(1)['rid'] == rid3)
     
     def test_database(self):
         """测试 Database 类"""
@@ -402,6 +467,29 @@ class TestRunner:
             # 验证 rid 连续
             new_rid = db2.insert('strict_t', {'id': 2, 'name': 'Bob', 'age': 25})
             self.test("持久化：rid 连续", new_rid == 2)
+
+            # 验证默认 .db 使用二进制页式格式
+            with open(db_path, 'rb') as f:
+                magic = f.read(8)
+            self.test("持久化：二进制页文件头", magic == b'MYDBPAGE')
+
+            # 验证兼容 json / pickle
+            json_path = os.path.join(tmpdir, 'test.json')
+            pkl_path = os.path.join(tmpdir, 'test.pkl')
+            Persistence.save(db1, json_path)
+            Persistence.save(db1, pkl_path)
+
+            db_json = Persistence.load(json_path)
+            db_pkl = Persistence.load(pkl_path)
+
+            self.test(
+                "持久化：json 兼容",
+                db_json.search_by_index('strict_t', 'id', 1, columns=['name']) == [{'rid': 1, 'name': 'Alice'}],
+            )
+            self.test(
+                "持久化：pickle 兼容",
+                db_pkl.search_by_index('strict_t', 'id', 1, columns=['name']) == [{'rid': 1, 'name': 'Alice'}],
+            )
             
         finally:
             shutil.rmtree(tmpdir)

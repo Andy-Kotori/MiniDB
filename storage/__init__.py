@@ -8,6 +8,7 @@ from .database import Database, Table, Row, SchemaMode
 from .persistence import Persistence
 from .index import Index, IndexManager, IndexType, OrderedIndex
 from .bplustree import BPlusTreeIndex
+from .page_manager import PageManager, PageType, PageSpan, PageFileHeader, DiskPage
 
 __all__ = [
     'Database', 
@@ -19,5 +20,10 @@ __all__ = [
     'IndexManager',
     'IndexType',
     'OrderedIndex',
-    'BPlusTreeIndex'
+    'BPlusTreeIndex',
+    'PageManager',
+    'PageType',
+    'PageSpan',
+    'PageFileHeader',
+    'DiskPage',
 ]
