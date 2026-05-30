@@ -1,0 +1,44 @@
+{
+  "name": "mydb",
+  "tables": {
+    "users": {
+      "name": "users",
+      "columns": [
+        "id",
+        "name",
+        "age"
+      ],
+      "next_rid": 4,
+      "mode": "strict",
+      "indices": {
+        "indices": {}
+      },
+      "rows": [
+        {
+          "rid": 1,
+          "data": {
+            "id": 1,
+            "name": "Alice",
+            "age": 21
+          }
+        },
+        {
+          "rid": 2,
+          "data": {
+            "id": 2,
+            "name": "Bob",
+            "age": 17
+          }
+        },
+        {
+          "rid": 3,
+          "data": {
+            "id": 3,
+            "name": "Cindy",
+            "age": 22
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,398 +1,366 @@
-# MyDB Storage 模块 - 角色B（内存存储引擎）
+# MiniDB 2.0 — 支持 MVCC + 事务的迷你数据库
 
-## 📋 项目概述
-
-这是三人小组数据库项目的**角色B部分**——内存存储引擎 + 简单持久化。
-
-**职责范围**：
-- ✅ 设计内存数据结构（Database → Table → Row）
-- ✅ 实现基础CRUD操作（CREATE TABLE, INSERT, SELECT, DELETE, UPDATE）
-- ✅ 实现简单持久化（pickle/json 全量序列化）
-- ✅ **增强查询**（按索引、指定列）
-- ✅ **严格/宽松模式**（灵活schema、自动扩列）
-- ✅ **列操作**（添加、删除、重命名列）
-- ✅ **封装性优化**（私有属性、接口访问）
-- ✅ 预留与角色C（索引/B+树）的对接接口
-- ❌ 不负责 SQL 解析（角色A）
-- ❌ 不负责 B+树索引和二进制分页（角色C）
-
-**核心设计原则**：
-1. **纯Python实现**，不依赖任何外部存储引擎（无SQLite/LevelDB/RocksDB/Pandas）
-2. **自增RowID**：永久唯一，删除后不复用（为B+树索引做准备）
-3. **接口稳定**：与角色A/C的接口在设计时就确定，内部实现可演进
+> 基于纯 Python 实现的教学级数据库系统，支持 SQL 交互、MVCC 多版本并发控制、行级锁、预写日志（WAL）和崩溃恢复。
 
 ---
 
-## 🗂️ 代码结构
+## 项目结构
 
 ```
-mydb/
+mydb2/
+├── main.py                      # 程序入口，启动 REPL
+├── storage_adapter.py           # 前后端适配器（支持普通/MVCC 双模式）
+├── frontend/
+│   ├── __init__.py
+│   ├── repl.py                  # 命令行交互、SQL 解析、事务命令
+│   └── where_parser.py          # WHERE 条件解析器
 ├── storage/
-│   ├── __init__.py      # 模块导出接口
-│   ├── database.py      # 核心数据结构（Database, Table, Row）
-│   └── persistence.py   # 持久化实现（pickle/json）
-├── test_storage.py      # 测试和演示代码
-└── README.md           # 本文件
+│   ├── __init__.py              # 模块导出
+│   ├── database.py              # 原始 Database / Table / Row（无事务）
+│   ├── mvcc_database.py         # MVCC 数据库（MvccDatabase）
+│   ├── mvcc_table.py            # MVCC 数据表（MvccTable）
+│   ├── transaction.py           # 事务管理器（TransactionManager）
+│   ├── lock_manager.py          # 行级锁管理器（LockManager）
+│   ├── version_store.py         # MVCC 版本链存储（VersionStore）
+│   ├── wal.py                   # 预写日志管理器（WALManager）
+│   ├── index.py                 # 索引管理器 + 有序数组索引
+│   ├── bplustree.py             # B+ 树索引实现
+│   ├── persistence.py           # 持久化（binary / pickle / json）
+│   └── page_manager.py          # 磁盘页管理器（4KB 页）
+├── minidb.data                  # 默认数据文件（JSON 格式）
+├── mydb2.wal                    # WAL 日志文件（二进制格式）
+└── .minidb_history              # REPL 命令历史
 ```
-
-### 文件说明
-
-#### `storage/database.py` - 核心数据结构
-
-实现了三级数据结构的纯内存管理：
-
-| 类 | 职责 | 类比（pandas） |
-|---|------|--------------|
-| `Row` | 单行数据，封装 rid + data | `Series` |
-| `Table` | 管理 schema 和 rows，维护自增 rid | `DataFrame` |
-| `Database` | 管理多个 Table | 包含多个 DataFrame 的字典 |
-
-**关键接口（与角色C对接）**：
-- `Table.get_by_rid(rid)` → `Optional[Row]`: 按行号查找
-- `Table.get_all()` → `List[Row]`: 获取所有行
-- `Row.rid`: 自增、永久唯一的行标识符
-
-**为什么需要稳定的 RowID？**
-- 角色C会实现B+树索引，索引的叶子节点存储的是 RowID
-- 当通过索引找到 RowID 后，需要调用 `get_by_rid` 获取实际数据
-- 如果 RowID 复用，索引会指向错误的数据
-
-#### 优化功能
-
-#### 1. 增强查询（优化点1）
-
-```python
-# 按索引（第几行）查询
-table.get_by_index(0)  # 获取第0行
-table.get_by_index(2, columns=['name', 'age'])  # 第2行，只看name和age
-
-# 指定列查询
-table.get_by_rid(1, columns=['name'])  # 只看name列
-table.get_all(columns=['id', 'name'])  # 只看id和name列
-```
-
-#### 2. 严格/宽松模式（优化点2）
-
-```python
-from storage import SchemaMode
-
-# 严格模式（默认）：未知列报错
-table = db.create_table('users', ['id', 'name'], mode=SchemaMode.STRICT)
-table.insert({'id': 1, 'unknown': 'x'})  # 报错！
-
-# 宽松模式：未知列自动扩列
-table = db.create_table('users', ['id', 'name'], mode=SchemaMode.LOOSE)
-table.insert({'id': 1, 'age': 20})  # 自动添加'age'列到所有行
-
-# 灵活更新：只改存在的列
-table.update_by_rid(1, {'name': 'New', 'unknown': 'x'})  # 只改name，忽略unknown
-```
-
-#### 3. 列操作（优化点3）
-
-```python
-# 添加列（所有行）
-table.add_column('email', default_value='@example.com')
-
-# 删除列（所有行）
-table.drop_column('old_column')
-
-# 重命名列
-table.rename_column('old_name', 'new_name')
-```
-
-#### 4. 封装性（优化点4）
-
-```python
-table = Table('users', ['id', 'name'])
-
-table.name  # 可以读
-table.name = 'new'  # 报错！只读属性
-
-table.columns  # 返回拷贝，修改不影响原表
-table.columns.append('age')  # 不影响原表
-
-table.get_table('users')  # 返回Table对象，可操作所有方法
-```
-
-### `storage/persistence.py` - 持久化
-
-提供全量序列化功能：
-
-| 方法 | 说明 |
-|-----|------|
-| `Persistence.save(db, path, fmt)` | 保存数据库到文件 |
-| `Persistence.load(path, fmt)` | 从文件加载数据库 |
-| `Persistence.exists(path)` | 检查文件是否存在 |
-| `Persistence.delete(path)` | 删除数据库文件 |
-
-**支持的格式**：
-- `pickle`（默认）：性能好，支持所有Python类型
-- `json`：可读性好，只支持基本类型
-
-**注意**：这是简化实现，采用**全量序列化**策略，适合学习和演示。
-真正的数据库会使用增量更新和WAL（Write-Ahead Logging），由角色C后续实现。
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
-### 1. 运行测试
-
-```bash
-cd mydb
-python test_storage.py
-```
-
-预期输出：
-```
-============================================================
-Storage 模块测试
-============================================================
-
-▶ Row 测试
-  ✓ Row 创建
-  ✓ Row 获取数据
-  ✓ Row 转字典
-  ...
-
-测试结果: 通过 XX, 失败 0
-============================================================
-```
-
-### 2. 运行演示
+### 安装依赖
 
 ```bash
-python test_storage.py --demo
+cd mydb2
+pip install sqlparse prompt_toolkit
 ```
 
-这会展示完整的使用流程：创建数据库 → 插入数据 → 查询 → 更新 → 删除 → 持久化 → 重新加载。
+### 启动交互式 REPL（MVCC 模式）
 
-### 3. 在你的代码中使用
+```bash
+python main.py --mvcc
+```
+
+```
+MiniDB started. Type '.exit' to quit, '.help' for help.
+minidb> CREATE TABLE users (id INT, name VARCHAR(50), age INT)
+Table 'users' created with columns: ['id', 'name', 'age']
+minidb> INSERT INTO users VALUES (1, 'Alice', 20)
+Inserted into 'users': [1, 'Alice', 20]
+minidb> SELECT * FROM users
++----+-------+-----+
+| id | name  | age |
++----+-------+-----+
+| 1  | Alice | 20  |
++----+-------+-----+
+```
+
+### 单条 SQL 执行
+
+```bash
+python main.py --mvcc -e "CREATE TABLE t (id INT, name VARCHAR(50))"
+python main.py --mvcc -e "INSERT INTO t VALUES (1, 'hello')"
+python main.py --mvcc -e "SELECT * FROM t"
+```
+
+---
+
+## 支持的 SQL 语句
+
+| 语句 | 示例 | 说明 |
+|------|------|------|
+| `CREATE TABLE` | `CREATE TABLE users (id INT, name VARCHAR(50))` | 创建表 |
+| `INSERT INTO` | `INSERT INTO users VALUES (1, 'Alice')` | 插入数据 |
+| `SELECT` | `SELECT * FROM users WHERE age > 20` | 查询（支持 WHERE、指定列） |
+| `UPDATE` | `UPDATE users SET age = 30 WHERE id = 1` | 条件更新（支持多列） |
+| `DELETE` | `DELETE FROM users WHERE id = 1` | 条件删除 |
+| `DROP TABLE` | `DROP TABLE users` | 删除表 |
+
+---
+
+## 事务命令
+
+| 命令 | 说明 |
+|------|------|
+| `.begin` | 开始事务（默认隔离级别：REPEATABLE READ） |
+| `.commit` | 提交事务 |
+| `.rollback` | 回滚事务 |
+| `.savepoint <name>` | 设置保存点 |
+| `.rollback_to <name>` | 回滚到指定保存点 |
+| `.tx` | 查看当前事务状态 |
+| `.locks` | 查看当前锁状态 |
+
+### 事务示例
+
+```
+minidb> .begin
+Transaction started (xid=1, isolation=REPEATABLE READ)
+minidb> INSERT INTO users VALUES (2, 'Bob', 25)
+minidb> SELECT * FROM users
++----+-------+-----+
+| id | name  | age |
++----+-------+-----+
+| 1  | Alice | 20  |
+| 2  | Bob   | 25  |
++----+-------+-----+
+minidb> .rollback
+Transaction rolled back (xid=1)
+minidb> SELECT * FROM users
++----+-------+-----+
+| id | name  | age |
++----+-------+-----+
+| 1  | Alice | 20  |
++----+-------+-----+
+```
+
+### 条件查询与更新示例
+
+```
+minidb> SELECT * FROM users WHERE age > 20
++----+---------+-----+
+| id | name    | age |
++----+---------+-----+
+| 2  | Bob     | 25  |
+| 3  | Charlie | 30  |
++----+---------+-----+
+
+minidb> SELECT name, age FROM users WHERE id = 1
++-------+-----+
+| name  | age |
++-------+-----+
+| Alice | 20  |
++-------+-----+
+
+minidb> UPDATE users SET age = 21 WHERE id = 1
+Updated 1 row(s).
+
+minidb> DELETE FROM users WHERE age > 25
+Deleted 1 row(s).
+```
+
+---
+
+## 其他点命令
+
+| 命令 | 说明 |
+|------|------|
+| `.exit` | 退出并保存数据 |
+| `.help` | 显示帮助 |
+| `.tables` | 列出所有表 |
+| `.schema <表名>` | 查看表结构 |
+
+---
+
+## 核心特性
+
+### 1. MVCC（多版本并发控制）
+
+- **读不阻塞读**：多个事务可以同时读取同一行
+- **读不阻塞写**：读操作不会阻止写操作
+- **写只锁单行**：写操作仅锁定目标行，不影响其他行
+
+### 2. 行级锁
+
+- **共享锁（S）**：用于读操作
+- **排他锁（X）**：用于写操作
+- **锁升级**：支持 S → X 升级
+- **死锁检测**：等待图算法自动检测死锁环
+- **锁超时**：默认 5 秒超时
+
+### 3. 隔离级别
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 |
+|---------|------|-----------|------|
+| READ UNCOMMITTED | ✅ 允许 | ✅ 允许 | ✅ 允许 |
+| READ COMMITTED | ❌ 禁止 | ✅ 允许 | ✅ 允许 |
+| REPEATABLE READ（默认）| ❌ 禁止 | ❌ 禁止 | ✅ 允许 |
+| SERIALIZABLE | ❌ 禁止 | ❌ 禁止 | ❌ 禁止 |
+
+### 4. WAL（预写日志）
+
+- 所有修改先写日志，再写数据
+- 日志文件：`mydb2.wal`
+- 支持崩溃恢复（Redo + Undo）
+
+### 5. 崩溃恢复
+
+启动时自动检查 WAL 文件：
+1. 找到最后一个 CHECKPOINT
+2. **Redo**：重放所有已提交事务的操作
+3. **Undo**：回滚所有未提交事务的操作
+
+---
+
+## Python API
+
+### 基本使用（自动事务）
 
 ```python
-from storage import Database, Persistence
+from storage_adapter import StorageAdapter
 
-# 创建数据库
-db = Database('mydb')
+storage = StorageAdapter(use_mvcc=True)
+storage.create_table('users', ['id', 'name', 'age'])
+storage.insert('users', [1, 'Alice', 20])
 
-# 创建表
+result = storage.select_all('users')
+print(result)
+# {'columns': ['id', 'name', 'age'], 'rows': [[1, 'Alice', 20]]}
+```
+
+### 显式事务
+
+```python
+from storage_adapter import StorageAdapter
+
+storage = StorageAdapter(use_mvcc=True)
+storage.create_table('users', ['id', 'name', 'age'])
+
+# 开始事务
+storage.begin()
+storage.insert('users', [1, 'Alice', 20])
+storage.insert('users', [2, 'Bob', 25])
+
+# 回滚（数据不会保存）
+storage.rollback()
+
+# 或者提交
+# storage.commit()
+```
+
+### 底层 API（直接使用 MvccDatabase）
+
+```python
+from storage import MvccDatabase, IsolationLevel
+
+db = MvccDatabase('mydb', wal_path='mydb2.wal')
 db.create_table('users', ['id', 'name', 'age'])
 
-# 插入数据
-rid = db.insert('users', {'id': 1, 'name': 'Alice', 'age': 20})
-print(f"插入的行号: {rid}")  # 输出: 1
+# 显式事务
+tx = db.begin(IsolationLevel.REPEATABLE_READ)
+db.insert(tx, 'users', {'id': 1, 'name': 'Alice', 'age': 20})
+db.commit(tx)
 
-# 查询所有数据
-rows = db.select_all('users')
-for row in rows:
-    print(row)  # {'rid': 1, 'id': 1, 'name': 'Alice', 'age': 20}
-
-# 按 RowID 查询（供角色C索引使用）
-row = db.get_by_rid('users', 1)
-print(row)
-
-# 保存到文件
-Persistence.save(db, 'mydb.db')
-
-# 从文件加载
-db2 = Persistence.load('mydb.db')
+# 保存点
+tx = db.begin()
+db.insert(tx, 'users', {'id': 2, 'name': 'Bob', 'age': 25})
+db.savepoint(tx, 'sp1')
+db.insert(tx, 'users', {'id': 3, 'name': 'Charlie', 'age': 30})
+db.rollback_to_savepoint(tx, 'sp1')  # Charlie 被撤销
+db.commit(tx)
 ```
 
 ---
 
-## 🔌 接口契约
+## 架构说明
 
-### 与角色A（前端/SQL解析）的接口
-
-角色A通过以下方法调用角色B的功能：
-
-```python
-# 数据库管理
-db = Database(name)                           # 创建数据库实例
-db.create_table(name, columns) -> Table      # 创建表
-db.drop_table(name) -> bool                  # 删除表
-db.list_tables() -> List[str]                # 列出所有表
-
-# 数据操作
-db.insert(table, data: dict) -> int          # 插入，返回 rid
-db.select_all(table) -> List[dict]           # 全表扫描
-db.get_by_rid(table, rid) -> Optional[dict]  # 按 rid 查询
-db.update(table, rid, new_data) -> bool      # 更新
-db.delete(table, rid) -> bool                # 删除
-
-# 持久化
-Persistence.save(db, path)
-db = Persistence.load(path)
-```
-
-### 与角色C（索引/B+树）的接口
-
-角色C需要角色B提供以下能力：
-
-1. **稳定的 RowID 系统**
-   - 自增、永久唯一
-   - 删除后不复用
-   - 持久化保存 `next_rid`
-
-2. **数据访问接口**
-   ```python
-   # Table 类提供
-   table.get_by_rid(rid) -> Optional[Row]     # O(n) 现在，后续可优化
-   table.get_all() -> List[Row]               # 全表扫描
-   
-   # Database 类提供（快捷方式）
-   db.get_by_rid(table_name, rid) -> Optional[dict]
-   ```
-
-3. **数据变更通知**（可选，用于索引更新）
-   - 当前简化实现不强制要求
-   - 角色C可自行维护索引与数据的同步
-
----
-
-## 🧠 核心概念解释
-
-### RowID 为什么重要？
-
-RowID 是连接**索引**和**数据**的桥梁：
+### 数据流
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  角色C: B+树索引                                      │
-│  ┌─────────┐                                        │
-│  │  name   │ ─────┐                                 │
-│  ├─────────┤      │                                 │
-│  │  Alice  │ ─────┼──→ 叶子节点存储: (Alice, rid=1)  │
-│  │   Bob   │ ─────┼──→ 叶子节点存储: (Bob, rid=2)    │
-│  └─────────┘      │                                 │
-│                   │                                 │
-│                   └──────────────────────┐          │
-└──────────────────────────────────────────┼──────────┘
-                                           │
-                                           ▼
-┌─────────────────────────────────────────────────────┐
-│  角色B: 数据存储                                      │
-│  ┌──────┬────┬───────┬─────┐                        │
-│  │ rid  │ id │ name  │ age │                        │
-│  ├──────┼────┼───────┼─────┤                        │
-│  │  1   │ 1  │ Alice │  20 │ ←── get_by_rid(1)      │
-│  │  2   │ 2  │  Bob  │  25 │ ←── get_by_rid(2)      │
-│  └──────┴────┴───────┴─────┘                        │
-└─────────────────────────────────────────────────────┘
+SQL 输入
+    │
+    ▼
+frontend/repl.py  ──SQL 解析──┐
+                              ▼
+              storage_adapter.py（适配器）
+                    │
+    ┌───────────────┼───────────────┐
+    ▼               ▼               ▼
+普通模式      MVCC 事务模式      持久化
+(Database)   (MvccDatabase)    (JSON/WAL)
+    │               │
+    ▼               ▼
+Table          MvccTable
+                │
+    ┌───────────┼───────────┐
+    ▼           ▼           ▼
+VersionStore  LockManager  WALManager
+(MVCC版本链)   (行级锁)     (预写日志)
 ```
 
-当用户查询 `WHERE name = 'Alice'` 时：
-1. 角色C的B+树找到 `Alice` 对应的 rid=1
-2. 角色C调用 `db.get_by_rid('users', 1)`
-3. 角色B返回完整的行数据
-
-**如果 rid 复用**，删除 rid=1 的行后插入新数据重用 rid=1，索引会指向错误的数据！
-
-### 全量序列化 vs 二进制分页
-
-| 特性 | 当前实现（全量序列化） | 角色C（二进制分页） |
-|-----|-------------------|------------------|
-| 保存粒度 | 整个 Database | 固定大小的页（如4KB） |
-| 格式 | pickle/json | 自定义二进制 |
-| 更新方式 | 全量覆盖 | 修改对应页 |
-| 适用场景 | 学习/小型数据 | 生产/大型数据 |
-| 复杂度 | 简单（几十行代码） | 复杂（缓冲池、页管理） |
-
-**当前选择全量序列化的原因**：
-- 角色B阶段聚焦数据结构设计和接口定义
-- 避免过早引入分页复杂度（页大小、缓冲池、页分裂等）
-- 接口稳定后，角色C可无缝替换存储层，角色A无感知
-
----
-
-## 📊 与 pandas 的对比
-
-如果你是 pandas 用户，以下是概念对照：
-
-| pandas | MyDB Storage | 说明 |
-|--------|-------------|------|
-| `df = pd.DataFrame(...)` | `table = Table('users', ['id', 'name'])` | 创建表 |
-| `df.loc[len(df)] = [...]` | `table.insert({'id': 1, 'name': 'Alice'})` | 插入行 |
-| `df.to_dict('records')` | `table.get_all()` | 获取所有行 |
-| `df.loc[0]` | `table.get_by_rid(1)` | 按位置访问 |
-| `df.to_pickle('file.pkl')` | `Persistence.save(db, 'file.db')` | 保存 |
-| `pd.read_pickle('file.pkl')` | `Persistence.load('file.db')` | 加载 |
-| `df['new_col'] = ...` | 暂不支持动态加列 | Schema 更严格 |
-
-**关键区别**：
-1. **显式 RowID**：pandas 用隐式整数索引，我们用显式 rid 且永不复用
-2. **Schema 约束**：插入时必须符合预定义的列，pandas 更灵活
-3. **持久化范围**：pandas 存单个 DataFrame，我们存整个 Database（多表）
-
----
-
-## 🔧 扩展和演进
-
-### 角色C加入后的可能演进
-
-当前实现是可演进的架构：
+### 版本链（MVCC 核心）
 
 ```
-阶段1（当前）          阶段2（角色C加入）
-┌──────────────┐      ┌──────────────────────────┐
-│   Database   │      │       Database           │
-├──────────────┤      ├──────────────────────────┤
-│   Table      │      │   Table + IndexManager   │
-├──────────────┤  →   ├──────────────────────────┤
-│  list[Row]   │      │   PageManager（角色C）    │
-└──────────────┘      ├──────────────────────────┤
-                      │   二进制文件              │
-                      └──────────────────────────┘
+rid=1 的版本链：
+
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  RowVersion     │     │  RowVersion     │     │  RowVersion     │
+│  created_by=3   │────▶│  created_by=2   │────▶│  created_by=1   │
+│  data={'age':21}│     │  data={'age':20}│     │  data={'age':18}│
+│  expired_by=0   │     │  expired_by=3   │     │  expired_by=2   │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+       ↑（最新）
+       │
+  事务3 更新 age=21
+  （未提交时只有事务3可见）
 ```
 
-- **接口不变**：`get_by_rid()`, `get_all()` 保持不变
-- **内部重构**：Table 不再用 list 存储，而是通过 PageManager 访问页
-- **角色A无感知**：前端代码无需修改
+---
+
+## 与 mydb（v1.0）的对比
+
+| 特性 | mydb (v1.0) | mydb2 (v2.0) |
+|------|-------------|--------------|
+| SQL 解析 | ❌ | ✅ sqlparse |
+| 交互式 REPL | ❌ | ✅ prompt_toolkit |
+| 内存分页 | ❌ | ✅ DataPage (4KB) |
+| B+ 树索引 | ❌ | ✅ |
+| 二进制持久化 | ❌ | ✅ 页式格式 |
+| **MVCC** | ❌ | ✅ |
+| **行级锁** | ❌ | ✅ |
+| **事务** | ❌ | ✅ BEGIN/COMMIT/ROLLBACK |
+| **保存点** | ❌ | ✅ SAVEPOINT |
+| **隔离级别** | ❌ | ✅ 4 级 |
+| **WAL** | ❌ | ✅ |
+| **崩溃恢复** | ❌ | ✅ Redo + Undo |
 
 ---
 
-## ❓ 常见问题
+## 已知限制
 
-**Q: 为什么不直接用 pandas？**  
-A: 项目要求是"从零实现"，目的是理解数据库底层机制。pandas 是一个复杂的上层库，隐藏了太多细节。
-
-**Q: 大文件会内存溢出吗？**  
-A: 当前全量序列化实现会。这是阶段性简化，角色C会实现分页解决此问题。
-
-**Q: 支持事务吗？**  
-A: 暂不支持。事务需要WAL和并发控制，属于进阶功能。
-
-**Q: 如何支持 WHERE 条件查询？**  
-A: WHERE 解析是角色A的工作，但执行可以优化：
-- 无索引：调用 `db.select_all()` 然后过滤（全表扫描）
-- 有索引（角色C）：通过索引找到 rid，调用 `db.get_by_rid()`
-
-**Q: 数据类型怎么检查？**  
-A: 当前简化实现不做严格类型检查（除了列名存在性）。可在 Table.insert() 中添加类型校验。
+1. **WHERE 限制**：支持 `=, !=, >, <, >=, <=` 和 `AND`，不支持 `OR`, `NOT`, `LIKE`, `IN`
+2. **JOIN**：暂不支持多表连接
+3. **ALTER TABLE**：仅支持列的增删改，不支持复杂表结构变更
+4. **网络访问**：仅支持本地嵌入式使用
+5. **大事务内存**：MVCC 版本链在事务期间保留旧版本，大事务可能消耗较多内存
 
 ---
 
-## 📝 待办清单（对接准备）
+## 测试
 
-与角色A、C对接前需要确认：
+```bash
+cd mydb2
 
-- [ ] **角色A**: 确认 SQL 解析后的数据结构格式
-  - INSERT 的数据是 dict 吗？`{'col': val}`
-  - 错误处理：抛异常 vs 返回错误码？
+# 运行所有模块的导入测试
+python -c "from storage import *; print('All imports OK')"
 
-- [ ] **角色A**: 持久化策略
-  - 自动保存（每次INSERT后）？
-  - 显式 SAVE 命令？
-  - 退出时保存？
+# 运行综合集成测试
+python -c "
+from storage import MvccDatabase, IsolationLevel
 
-- [ ] **角色C**: 索引更新时机
-  - 插入时立即更新索引？
-  - 还是批量更新？
-  - 需要角色B通知变更吗？
+db = MvccDatabase('test')
+db.create_table('users', ['id', 'name'])
+
+tx = db.begin()
+db.insert(tx, 'users', {'id': 1, 'name': 'Alice'})
+db.commit(tx)
+
+tx = db.begin()
+rows = db.select_all(tx, 'users')
+print(rows)
+db.commit(tx)
+"
+```
 
 ---
 
-## 📄 License
+## License
 
 学习项目，自由使用。

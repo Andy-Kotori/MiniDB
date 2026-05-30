@@ -1,0 +1,36 @@
+{
+  "name": "mydb",
+  "tables": {
+    "students": {
+      "name": "students",
+      "columns": [
+        "id",
+        "name",
+        "score"
+      ],
+      "next_rid": 3,
+      "mode": "strict",
+      "indices": {
+        "indices": {}
+      },
+      "rows": [
+        {
+          "rid": 1,
+          "data": {
+            "id": 1,
+            "name": "张三",
+            "score": 90
+          }
+        },
+        {
+          "rid": 2,
+          "data": {
+            "id": 2,
+            "name": "李四",
+            "score": 85
+          }
+        }
+      ]
+    }
+  }
+}
